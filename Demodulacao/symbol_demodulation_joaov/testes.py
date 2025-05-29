@@ -1,6 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from cp_func import get8APSK, generate_8apsk_samples, slicer_demodulation, plot_decision_borders
+from cp_func import *
 
 def test_8apsk_system():
     # Configuração inicial

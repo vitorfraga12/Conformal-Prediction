@@ -10,6 +10,7 @@ from tqdm import tqdm
 np.random.seed(12) # for reproducibility
 torch.manual_seed(12) # for reproducibility
 alpha_index = 0.1 # 0.9 of confiability (1-α)
+awgn_situation = True # If True, the channel is AWGN
 
 def lin2dB(x):
     return 10*np.log10(x) # Convert linear scale to dB
@@ -180,3 +181,93 @@ def plot_decision_borders(constellation_params):
     plt.grid(True)
     plt.axis('equal')
     plt.title('8APSK Constellation')
+
+
+
+## 2 - System Model
+def channel_states():
+    """
+    Simulates and returns a new channel state dictionary.
+    
+    Returns:
+        dict: Dictionary containing channel state parameters:
+              'tx_amp_imbalance_factor', 'tx_phase_imbalance_factor', 'ch_mult_factor'.
+    """
+    # Generate the channel multiplication factor
+    ch_mult_factor = torch.randn(1, dtype=torch.cfloat) # Corresponds to ψ (psi) in the article 
+
+    # Create a beta distribution for the transmitter imperfection factors
+    rand_beta_dist_instance = torch.distributions.Beta(torch.tensor(5), torch.tensor(2))
+    
+    # If AWGN situation is forced, remove amplitude variation from fading
+    if awgn_situation: 
+        ch_mult_factor /= ch_mult_factor.abs() 
+    
+    # Sample transmitter imperfection factors using the beta distribution instance
+    tx_amplitude_imbalance_factor = rand_beta_dist_instance.sample() * 0.15 # Corresponds to ϵ (epsilon) in the article 
+    tx_phase_imbalance_factor = rand_beta_dist_instance.sample() * 15 * np.pi / 180 # Corresponds to δ (delta) in the article 
+    
+    # Return the channel state dictionary, "c" in the article
+    d_channel_state = {
+        'tx_amp_imbalance_factor': tx_amplitude_imbalance_factor,
+        'tx_phase_imbalance_factor': tx_phase_imbalance_factor,
+        'ch_mult_factor': ch_mult_factor
+    }
+    
+    return d_channel_state
+
+def simulate_channel_aplication(num_samples, b_enforce_pattern, b_noise_free,
+                                d_setting, channel_state, mod_constellation_params):
+    """
+    Simulates a channel step for demodulation, applying imperfections and noise.
+    
+    Args:
+        num_samples (int): Number of samples to generate.
+        b_enforce_pattern (bool): If True, uses a fixed pattern for TX symbol generation.
+        b_noise_free (bool): If True, no noise is added.
+        d_setting (dict): Configuration dictionary, containing 'snr_dB'.
+        channel_state (dict): Dictionary containing channel state parameters (ψ, ϵ, δ).
+        mod_constellation_params (dict): Modulation constellation parameters (from get_8apsk_constellation_params).
+        
+    Returns:
+        tuple: (rx_real_iq, tx_sym_uint)
+               rx_real_iq (torch.Tensor): Received signals (real and imaginary parts separated).
+               tx_sym_uint (torch.Tensor): Original transmitted symbols (integer indices).
+    """
+    # Define the symbol generation pattern
+    pattern = 0 if b_enforce_pattern else -1
+
+    # 1. Generate TX Symbols
+    tx_iq, tx_sym_uint = generate_8apsk_samples(num_samples, pattern, mod_constellation_params)
+
+    # 2. Get channel state parameters
+    epsilon = channel_state['tx_amp_imbalance_factor'] # ϵ (epsilon) from the article
+    ch_mult_factor = channel_state['ch_mult_factor']   # Complex channel factor (contains ψ)
+    delta = channel_state['tx_phase_imbalance_factor'] # δ (delta) from the article
+
+    cos_delta = torch.cos(delta) 
+    sin_delta = torch.sin(delta)
+
+    # 3. Apply Transmitter Hardware Imperfections (I/Q Imbalance and Phase Rotation, Eq. 28 from the article) [cite: 248]
+
+    tx_distorted_real = (1 + epsilon) * (cos_delta * tx_iq.real - sin_delta * tx_iq.imag)
+    tx_distorted_imag = (1 - epsilon) * (cos_delta * tx_iq.imag - sin_delta * tx_iq.real)
+    
+    tx_distorted = tx_distorted_real + 1j * tx_distorted_imag # This is the f_IQ function from the article [cite: 246, 248]
+
+    # 4. Apply Channel Effect (Complex Multiplication) [cite: 246]
+    tx_rayleighed = tx_distorted * ch_mult_factor
+
+    # 5. Add Noise (AWGN) [cite: 246]
+    rx_iq = tx_rayleighed # Initialize with the signal before noise addition
+    if not b_noise_free: # If it's not a noise-free situation
+        snr_lin = dB2lin(d_setting['snr_dB']) # Calculate linear SNR from d_setting
+        noise_std_dev = np.sqrt(0.5 / snr_lin)
+        noise = noise_std_dev * (torch.randn(num_samples, dtype=torch.float64) + 1j * torch.randn(num_samples, dtype=torch.float64))
+        rx_iq += noise # Add noise
+
+    # 6. Convert the received signal to real format (I and Q separated)
+    # The neural network expects inputs as real tensors [num_samples, 2]
+    rx_real_iq = torch.stack([rx_iq.real, rx_iq.imag], dim=1).type(torch.float64)
+
+    return rx_real_iq, tx_sym_uint
