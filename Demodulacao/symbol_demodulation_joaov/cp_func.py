@@ -271,3 +271,212 @@ def simulate_channel_aplication(num_samples, b_enforce_pattern, b_noise_free,
     rx_real_iq = torch.stack([rx_iq.real, rx_iq.imag], dim=1).type(torch.float64)
 
     return rx_real_iq, tx_sym_uint
+
+
+
+## 3 - Data Set Preparation
+def leave_one_out_data(x_input: torch.Tensor, y_output: torch.Tensor, index: int): #-> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns a new dataset with one sample removed (leave-one-out - LOO). Used to CV-CP 
+    
+    Args:
+        x_input (torch.Tensor): Input features tensor.
+        y_output (torch.Tensor): Output labels tensor.
+        index (int): Index of the sample to be removed.
+        
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: (X_loo, y_loo) - Tensors representing the dataset with one sample left out.
+    """
+    N_len = len(y_output)
+    
+    # Input validation (optional, but good practice)
+    if not (0 <= index < N_len):
+        raise IndexError(f"Index {index} is out of bounds for dataset of size {N_len}.")
+        
+    # Create indices for all samples except the one at 'index'
+    indices_loo = np.concatenate((np.arange(0, index), np.arange(index + 1, N_len)), axis=0)
+    
+    # Convert numpy array of indices to a PyTorch tensor for advanced indexing
+    indices_loo_tensor = torch.from_numpy(indices_loo).long()
+    
+    # Use the generated indices to select elements from X and y
+    X_loo = x_input[indices_loo_tensor, :]
+    y_loo = y_output[indices_loo_tensor]
+    
+    return X_loo, y_loo
+
+def leave_fold_out_data(x_input: torch.Tensor, y_output: torch.Tensor, fold_index: int, num_folds: int): #-> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns a new dataset with one fold removed (leave-fold-out - LFO). Used to K-CV-CP
+    
+    Args:
+        x_input (torch.Tensor): Input features tensor.
+        y_output (torch.Tensor): Output labels tensor.
+        fold_index (int): Index of the fold to be removed (0-indexed).
+        num_folds (int): Total number of folds.
+        
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: (X_lfo, y_lfo) - Tensors representing the dataset with one fold left out.
+    """
+    N_len = len(y_output)
+    # Calculate the number of samples per fold. Rounding is consistent with original code.
+    N_over_K = round(N_len / num_folds)
+    
+    if N_len % num_folds != 0:
+        print(f"Warning: Dataset size ({N_len}) is not perfectly divisible by num_folds ({num_folds}).")
+
+    # Input validation
+    if not (0 <= fold_index < num_folds):
+        raise IndexError(f"Fold index {fold_index} is out of bounds for {num_folds} folds.")
+
+    # Calculate start and end indices of the fold to be excluded
+    fold_start_idx = fold_index * N_over_K
+    fold_end_idx = (fold_index + 1) * N_over_K
+    
+    # Concatenate indices for the segments before and after the excluded fold
+    indices_lfo = np.concatenate((np.arange(0, fold_start_idx), np.arange(fold_end_idx, N_len)), axis=0)
+    
+    # Convert numpy array of indices to a PyTorch tensor for advanced indexing
+    indices_lfo_tensor = torch.from_numpy(indices_lfo).long()
+    
+    # Select elements using the generated indices
+    X_lfo = x_input[indices_lfo_tensor, :]
+    y_lfo = y_output[indices_lfo_tensor]
+    
+    return X_lfo, y_lfo
+
+
+def split_data_into_subsets(x_input: torch.Tensor, y_output: torch.Tensor, N_samples_first_subset: int, shuffle: bool = True):# -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Splits the dataset into two subsets (e.g., training and validation). Used to VB-CP
+    
+    Args:
+        x_input (torch.Tensor): Input features tensor.
+        y_output (torch.Tensor): Output labels tensor.
+        N_samples_first_subset (int): Number of samples for the first subset.
+        shuffle (bool, optional): If True, shuffles the data before splitting. Defaults to True.
+        
+    Returns:
+        tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]: 
+            A tuple containing two (X, y) tuples: ((X0, y0), (X1, y1)),
+            representing the training and validation subsets respectively.
+    """
+    N_len = len(y_output)
+
+    # Handle edge cases where one subset is empty or all data goes into one subset
+    if N_samples_first_subset == 0: # All data in second subset
+        return ( (torch.empty(0, x_input.shape[1], dtype=x_input.dtype), torch.empty(0, dtype=y_output.dtype)), (x_input, y_output) )
+    elif N_samples_first_subset == N_len: # All data in first subset
+        return ( (x_input, y_output), (torch.empty(0, x_input.shape[1], dtype=x_input.dtype), torch.empty(0, dtype=y_output.dtype)) )
+    
+    # Generate permutation indices
+    if shuffle:
+        perm = torch.randperm(N_len)
+    else:
+        perm = torch.arange(0, N_len)
+    
+    # Split X and y using the generated permutation indices
+    X0 = x_input[perm[:N_samples_first_subset], :]
+    y0 = y_output[perm[:N_samples_first_subset]]
+    
+    X1 = x_input[perm[N_samples_first_subset:], :] # Corrected slicing for N1 (rest of the data)
+    y1 = y_output[perm[N_samples_first_subset:]] # Corrected slicing for N1 (rest of the data)
+    
+    return ( (X0, y0), (X1, y1) )
+
+
+
+## 4 - Neural Network Models
+class FcReluDnn(nn.Module):
+    """
+    Fully-Connected ReLU Deep Neural Network.
+    This class defines the neural network architecture.
+    """
+    def __init__(self, vLayers: list):
+        """
+        Constructor for the FcReluDnn model.
+        
+        Args:
+            vLayers (list): A list of integers defining the number of neurons in each layer.
+                            Example: [input_dim, hidden1_dim, hidden2_dim, ..., output_dim].
+        """
+        super(FcReluDnn, self).__init__()
+        
+        self.hidden = nn.ModuleList() # Use ModuleList to store linear layers
+        
+        # Create linear layers with ReLU activation for hidden layers
+        # and a final linear layer for the output (no activation here, softmax applied later).
+        for l_idx, (input_size, output_size) in enumerate(zip(vLayers, vLayers[1:])):
+            # All layers use torch.float64 as specified in the original code for Hessian calculations
+            linear_layer = nn.Linear(input_size, output_size, dtype=torch.float64)
+            self.hidden.append(linear_layer)
+        
+    def forward(self, activation: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the neural network.
+        
+        Args:
+            activation (torch.Tensor): Input tensor to the network.
+        
+        Returns:
+            torch.Tensor: Output tensor (logits before softmax).
+        """
+        L = len(self.hidden) # Number of layers
+        
+        for l_idx, linear_transform in enumerate(self.hidden):
+            activation = linear_transform(activation)
+            # Apply ReLU activation for all hidden layers (not the last output layer)
+            if l_idx < L - 1:
+                activation = torch.nn.functional.relu(activation)
+        return activation
+
+    def num_parameters(self) -> int:
+        """
+        Calculates the total number of trainable parameters in the model.
+        
+        Returns:
+            int: Total number of parameters.
+        """
+        return sum(torch.numel(w) for w in self.parameters())
+
+
+class FcReluDnn_external(nn.Module):
+    """
+    Fully-Connected ReLU Deep Neural Network designed to operate with externally provided parameters.
+    This is used when model parameters are managed and passed explicitly (e.g., for Hessian calculations).
+    """
+    def __init__(self):
+        """
+        Constructor for the FcReluDnn_external model.
+        It does not initialize its own nn.Linear layers, as parameters are external.
+        """
+        super(FcReluDnn_external, self).__init__()
+        # Note: No need to initialize nn.Linear layers here since parameters are provided externally.
+        # This module will be used to apply linear transformations and activations given external weights/biases.
+        
+    def forward(self, net_in: torch.Tensor, net_params: list[torch.Tensor]) -> torch.Tensor:
+        """
+        Forward pass using externally provided network parameters.
+        
+        Args:
+            net_in (torch.Tensor): Input tensor to the network.
+            net_params (list[torch.Tensor]): A list of tensors representing the weights and biases of all layers.
+                                            Assumed to be ordered as [weight1, bias1, weight2, bias2, ...].
+        
+        Returns:
+            torch.Tensor: Output tensor (logits before softmax).
+        """
+        # Calculate number of layers from the parameter list (each layer has weight and bias)
+        L = len(net_params) // 2 
+        
+        for ll in range(L):
+            curr_layer_weight = net_params[2 * ll]
+            curr_layer_bias = net_params[2 * ll + 1]
+            
+            # Apply linear transformation using functional API
+            net_in = torch.nn.functional.linear(net_in, curr_layer_weight, curr_layer_bias)
+            
+            # Apply ReLU activation for all hidden layers (not the last output layer)
+            if ll < L - 1: 
+                net_in = torch.nn.functional.relu(net_in)
+        return net_in
