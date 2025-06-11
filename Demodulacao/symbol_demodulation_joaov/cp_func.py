@@ -480,3 +480,321 @@ class FcReluDnn_external(nn.Module):
             if ll < L - 1: 
                 net_in = torch.nn.functional.relu(net_in)
         return net_in
+
+
+
+## 5 - Training and Evaluation Functions
+def fitting_erm_ml__gd(
+    model: nn.Module, D_X: torch.Tensor,  D_y: torch.Tensor, D_te_X: torch.Tensor, D_te_y: torch.Tensor, gd_init_sd: dict, gd_lr: float, gd_num_iters: int):# -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Trains a neural network model using Empirical Risk Minimization (ERM)
+    with Maximum Likelihood (ML) objective via full-batch Gradient Descent.
+    
+    Args:
+        model (nn.Module): The neural network model instance to be trained. Its parameters
+                           will be updated during training.
+        D_X (torch.Tensor): Features (X) of the training dataset.
+        D_y (torch.Tensor): Labels (y) of the training dataset.
+        D_te_X (torch.Tensor): Features (X) of the test dataset (used only for validation loss tracking).
+        D_te_y (torch.Tensor): Labels (y) of the test dataset (used only for validation loss tracking).
+        gd_init_sd (dict): Initial state dictionary of the model's parameters to reset the model before training.
+        gd_lr (float): Learning rate for Gradient Descent.
+        gd_num_iters (int): Number of Gradient Descent iterations.
+        
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]:
+            - v_loss_tr (torch.Tensor): Tensor of training loss values across iterations.
+            - v_loss_te (torch.Tensor): Tensor of test loss values across iterations.
+    """
+    # Reset model to its initial state before starting training
+    model.load_state_dict(gd_init_sd)
+    
+    # Define the loss criterion for classification (Cross Entropy Loss)
+    criterion = nn.CrossEntropyLoss()
+    
+    # Tensors to store loss history during training
+    v_loss_tr = torch.zeros(gd_num_iters, dtype=torch.float)
+    v_loss_te = torch.zeros(gd_num_iters, dtype=torch.float)
+    
+    for i_iter in range(gd_num_iters):
+        # Evaluate test loss at current iteration (detached from graph to prevent gradient calculation)
+        v_loss_te[i_iter] = criterion(model(D_te_X), D_te_y).detach()
+        
+        # Zero out gradients for all model parameters before performing a new backward pass.
+        # This is a manual equivalent of `optimizer.zero_grad()`.
+        for w in model.parameters():
+            if w.grad is not None:
+                w.grad.data.zero_() # Set existing gradients to zero
+            else:
+                w.grad = torch.zeros_like(w.data) # Initialize if grad is None (first iteration)
+        
+        # Perform forward pass on the full training dataset and calculate the training loss
+        # (This implements full-batch Gradient Descent)
+        loss = criterion(model(D_X), D_y)
+        
+        # Perform backward pass to compute gradients of the loss with respect to model parameters
+        loss.backward()
+        
+        # Update model parameters using the computed gradients
+        # This is a manual equivalent of `optimizer.step()`.
+        for w in model.parameters():
+            w.data -= gd_lr * w.grad.data # Parameter update rule for GD
+        
+        # Store training loss for current iteration (detached from graph)
+        v_loss_tr[i_iter] = loss.detach()
+        
+    return v_loss_tr, v_loss_te
+
+
+def eval_hessian(loss_grad: tuple[torch.Tensor, ...], model: nn.Module): #-> torch.Tensor:
+    """
+    Evaluates the full Hessian matrix from a flat list of first-order gradients.
+    This function is based on a common PyTorch recipe for computing the Hessian.
+    
+    Args:
+        loss_grad (tuple[torch.Tensor, ...]): Tuple of first-order gradients (obtained with create_graph=True).
+                                             These gradients are computed with respect to model.parameters().
+        model (nn.Module): The model instance whose parameters' Hessian is being computed.
+        
+    Returns:
+        torch.Tensor: The reconstructed square Hessian matrix.
+    """
+    # Flatten all first-order gradients into a single vector
+    g_vector = torch.cat([g.contiguous().view(-1) for g in loss_grad])
+    
+    l = g_vector.size(0) # Total number of parameters (length of the flattened gradient vector)
+    hessian = torch.zeros((l, l), dtype=torch.float64) # Initialize the Hessian matrix (l x l) with zeros
+    
+    # Compute second-order gradients for each element in the flattened first-order gradient vector
+    for idx in range(l):
+        # Compute gradients of g_vector[idx] (a single scalar element of the first-order gradient)
+        # with respect to all parameters of the model.
+        # `create_graph=True` is crucial here because we need to compute gradients of these
+        # second-order gradients later if necessary (though not in this specific function's return).
+        grad2rd = torch.autograd.grad(g_vector[idx], model.parameters(), create_graph=True)
+        
+        # Flatten these second-order gradients (which are also a tuple of tensors)
+        # and assign them as a row in the Hessian matrix.
+        hessian[idx] = torch.cat([g.contiguous().view(-1) for g in grad2rd])
+        
+    return hessian
+
+
+def fitting_erm_map_gd(model: nn.Module, D_X_training: torch.Tensor, D_y_training: torch.Tensor, D_test_X: torch.Tensor, D_test_y: torch.Tensor, gd_init_sd: dict, gd_lr: float, gd_num_iters: int, gamma: float, ensemble_size: int, compute_hessian: int, lmc_burn_in: int, lmc_lr_init: float, lmc_lr_decaying: float, compute_bays: bool): #-> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Trains a neural network model using Empirical Risk Minimization (ERM)
+    with Maximum A Posteriori (MAP) objective via full-batch Gradient Descent.
+    Also generates Bayesian ensembles using Langevin Monte Carlo (LMC)
+    and Hessian/Fisher Information Matrix (FIM) approximations.
+    
+    Args:
+        model (nn.Module): The neural network model instance for MAP training. Its parameters
+                           will be updated.
+        D_X_training (torch.Tensor): Features (X) of the training dataset.
+        D_y_training (torch.Tensor): Labels (y) of the training dataset.
+        D_test_X (torch.Tensor): Features (X) of the test dataset (for evaluation only).
+        D_test_y (torch.Tensor): Labels (y) of the test dataset (for evaluation only).
+        gd_init_sd (dict): Initial state dictionary for the model.
+        gd_lr (float): Learning rate for MAP/GD optimization.
+        gd_num_iters (int): Number of iterations for MAP optimization.
+        gamma (float): L2 regularization coefficient for MAP (prior precision).
+        ensemble_size (int): Number of model samples for Bayesian ensembles.
+        compute_hessian (int): Flag for Hessian computation (0: none, 1: model-based, 2: grad(grad)).
+        lmc_burn_in (int): Number of initial samples to discard in LMC.
+        lmc_lr_init (float): Initial learning rate for LMC.
+        lmc_lr_decaying (float): Decay factor for LMC learning rate.
+        compute_bays (bool): Flag to enable Bayesian ensemble generation.
+        
+    Returns:
+        tuple: (v_loss_tr_map, v_loss_te_map, v_lmc_loss_tr, v_lmc_loss_te,
+                ensemble_vectors_hes, ensemble_vectors_fim, ensemble_vectors_lmc)
+            - v_loss_tr_map (torch.Tensor): Training loss history for MAP.
+            - v_loss_te_map (torch.Tensor): Test loss history for MAP.
+            - v_lmc_loss_tr (torch.Tensor): Training loss history for LMC.
+            - v_lmc_loss_te (torch.Tensor): Test loss history for LMC.
+            - ensemble_vectors_hes (torch.Tensor): Ensemble of model parameters from Hessian approximation.
+            - ensemble_vectors_fim (torch.Tensor): Ensemble of model parameters from FIM approximation.
+            - ensemble_vectors_lmc (torch.Tensor): Ensemble of model parameters from LMC.
+    """
+    # 1. Train MAP solution
+    model.load_state_dict(gd_init_sd) # Reset model to initial state
+    lmc_model = deepcopy(model) # Model for Langevin Monte Carlo (starts from same initial state as MAP)
+    ext_model = FcReluDnn_external() # Instance of the external model class, used for compute_hessian == 1
+    criterion = nn.CrossEntropyLoss() # Loss function for both MAP and LMC
+    N = len(D_y_training) # Number of training samples (from training data labels)
+    
+    v_loss_tr_map = torch.zeros(gd_num_iters, dtype=torch.float64)
+    v_loss_te_map = torch.zeros(gd_num_iters, dtype=torch.float64)
+    
+    for i_iter in range(gd_num_iters):
+        v_loss_te_map[i_iter] = criterion(model(D_test_X), D_test_y).detach() # Evaluate test loss for MAP model
+        
+        # Zero out gradients for all model parameters before backward pass
+        for w in model.parameters():
+            if w.grad is not None: w.grad.data.zero_()
+            else: w.grad = torch.zeros_like(w.data) # Initialize if None
+            
+        loss = criterion(model(D_X_training), D_y_training) # Calculate training loss (likelihood term)
+        loss.backward() # Compute gradients
+        
+        # Update parameters with L2 regularization term (MAP update rule)
+        for w in model.parameters():
+            w.data -= gd_lr * (w.grad.data + gamma / N * w.data)
+        v_loss_tr_map[i_iter] = loss.detach()
+
+    # Get the final MAP solution parameters as a flattened vector
+    v_phi_map = torch.nn.utils.parameters_to_vector(model.parameters()).double()
+    
+    # Initialize ensemble vectors with the MAP solution (these will be updated or replaced later)
+    # .detach().clone() to create independent copies
+    ensemble_vectors_lmc = v_phi_map.detach().clone().repeat(ensemble_size, 1)
+    ensemble_vectors_hes = deepcopy(ensemble_vectors_lmc) # Will be overwritten if compute_hessian != 0
+    ensemble_vectors_fim = deepcopy(ensemble_vectors_lmc) # Will be overwritten if compute_bays is False or compute_hessian is 0 and FIM is not computed
+
+    # --- Bayesian Ensemble Generation ---
+    if compute_bays: # Flag to enable Bayesian computations
+        # 2. Langevin Monte Carlo (LMC) approach for creating an ensemble
+        lmc_num_iters = lmc_burn_in + ensemble_size - 1 # Total LMC iterations
+        
+        # Learning rate scheduling for LMC (decaying or constant)
+        if lmc_lr_decaying > 1.0:
+            lmc_lr_last = lmc_lr_init / lmc_lr_decaying
+            lmc_lr_gamma = 0.55 # Fixed gamma for decay (from original code)
+            # 'b' and 'a' parameters define the decaying function: lr_a * (lr_b + iter)**(-lr_gamma)
+            lmc_lr_b = (lmc_num_iters - 1) / (((lmc_lr_init / lmc_lr_last)**(1 / lmc_lr_gamma)) - 1)
+            lmc_lr_a = lmc_lr_init * (lmc_lr_b**lmc_lr_gamma)
+        else: # Constant learning rate
+            lmc_lr_gamma = 0
+            lmc_lr_b = 0
+            lmc_lr_a = lmc_lr_init
+            
+        v_lmc_loss_tr = torch.zeros(lmc_num_iters, dtype=torch.float)
+        v_lmc_loss_te = torch.zeros(lmc_num_iters, dtype=torch.float)
+        lmc_temperature = 20.0 # Langevin MC temperature (from original code)
+        
+        for i_iter in range(lmc_num_iters):
+            lmc_lr = lmc_lr_a * (lmc_lr_b + i_iter)**(-lmc_lr_gamma) # Calculate current LMC learning rate
+            v_lmc_loss_te[i_iter] = criterion(lmc_model(D_test_X), D_test_y).detach() # Evaluate test loss for LMC model
+            
+            # Zero gradients for LMC model parameters
+            for w in lmc_model.parameters():
+                if w.grad is not None: w.grad.data.zero_()
+                else: w.grad = torch.zeros_like(w.data)
+                
+            loss = criterion(lmc_model(D_X_training), D_y_training) # Calculate training loss for LMC
+            loss.backward() # Compute gradients for LMC
+            
+            for w in lmc_model.parameters():
+                # LMC update rule:
+                # Gradient from likelihood + gradient from prior (L2 reg) + Gaussian noise
+                lmc_update_term = - lmc_lr * (w.grad.data + gamma / N * w.data)
+                # Noise is added only after the burn-in period (original code had a commented out `if 0:` condition
+                # implying noise *always* added or *never* during burn-in; following the `else` block as the intended logic)
+                if (i_iter + 1 >= lmc_burn_in):
+                    # Add Gaussian noise scaled by learning rate, N, and temperature
+                    lmc_update_term += np.sqrt(2 * lmc_lr / (N * lmc_temperature)) * torch.randn_like(w.data)
+                w.data += lmc_update_term
+                
+            # After the burn-in period, save the model parameters to form the ensemble
+            if (i_iter + 1 >= lmc_burn_in):
+                r = i_iter + 1 - lmc_burn_in # Index for the ensemble vector
+                if r < ensemble_size: # Ensure we only save up to ensemble_size samples
+                    ensemble_vectors_lmc[r, :] = torch.nn.utils.parameters_to_vector(lmc_model.parameters())
+            v_lmc_loss_tr[i_iter] = loss.detach()
+
+        # 3. Hessian and Fisher Information Matrix (FIM) approaches for Bayesian ensemble
+        # These methods approximate the posterior distribution of parameters as a Gaussian.
+        # This part can be computationally intensive.
+        if compute_hessian == 1: # Model-based Hessian using FcReluDnn_external
+            model_for_hessian = deepcopy(model) # Start from the trained MAP model
+            # Define a nested function for loss calculation used by torch.autograd.functional.hessian
+            # This function needs to accept parameters as a tuple which FcReluDnn_external will use
+            # to compute the forward pass.
+            def loss_for_hessian_func(*in_params):
+                # Using ext_model to compute loss given external parameters
+                return criterion(ext_model(D_X_training, list(in_params)), D_y_training)
+            
+            # Compute the full Hessian matrix using torch.autograd.functional.hessian
+            # This returns a nested tuple of tensors
+            t_hessian_nested = torch.autograd.functional.hessian(
+                loss_for_hessian_func,
+                tuple(model_for_hessian.parameters()) # Pass current parameters as a tuple
+            )
+            
+            # Reconstruct the full Hessian matrix from the nested tuple structure
+            # This part flattens the nested structure into a single square matrix
+            m_hessian = torch.cat([torch.cat([block.reshape(-1) for block in row], dim=0).unsqueeze(0) for row in t_hessian_nested], dim=0)
+            m_hessian = m_hessian.reshape(v_phi_map.numel(), v_phi_map.numel()) # Reshape to square matrix
+            m_hessian = 0.5 * (m_hessian + m_hessian.T) # Symmetrize to remove numerical asymmetry
+            
+        elif compute_hessian == 2: # Gradient of Gradient Hessian computation
+            model_for_hessian = deepcopy(model) # Start from the trained MAP model
+            # Zero gradients for the model used in Hessian calculation
+            for w in model_for_hessian.parameters():
+                if w.grad is not None: w.grad.data.zero_()
+                else: w.grad = torch.zeros_like(w.data)
+            
+            loss_for_hessian_grad2 = criterion(model_for_hessian(D_X_training), D_y_training)
+            # Compute first-order gradients with create_graph=True to allow for second-order gradient calculation
+            loss_grad = torch.autograd.grad(
+                loss_for_hessian_grad2,
+                model_for_hessian.parameters(),
+                create_graph=True # Essential for computing second-order gradients
+            )
+            # Compute the full Hessian matrix using the external eval_hessian helper function
+            m_hessian = eval_hessian(loss_grad, model_for_hessian)
+            m_hessian = 0.5 * (m_hessian + m_hessian.T) # Symmetrize
+        
+        # 4. Empirical Fisher Information Matrix (FIM) approximation
+        # FIM is approximated by the average outer product of gradients for each sample.
+        m_fim_D = torch.zeros((v_phi_map.numel(), v_phi_map.numel()), dtype=torch.float64)
+        
+        for x_sample, y_sample in zip(D_X_training, D_y_training): # Loop over individual training samples
+            # Zero gradients for each sample's gradient calculation
+            for w in model.parameters():
+                if w.grad is not None: w.grad.data.zero_()
+                else: w.grad = torch.zeros_like(w.data)
+            
+            # Compute loss for one sample (reshaping x_sample to (1,-1) for model input, y_sample to (-1) for criterion)
+            loss_per_sample = criterion(model(x_sample.view(1, -1)), y_sample.view(-1))
+            
+            # Compute gradients for this single sample
+            # retain_graph=True is needed because `model` is used across samples in this loop.
+            v_grad_per_sample = torch.nn.utils.parameters_to_vector(
+                torch.autograd.grad(loss_per_sample, model.parameters(), retain_graph=True)
+            )
+            # Add outer product of the gradient vector to FIM
+            m_fim_D += torch.mm(v_grad_per_sample.view(-1, 1), v_grad_per_sample.view(1, -1))
+        m_fim_D /= N # Normalize FIM by number of samples
+
+        # 5. Form Ensembles from Hessian and FIM approximations (assuming Gaussian posterior)
+        # This step approximates the posterior distribution of parameters as a multivariate Gaussian.
+        # The mean is the MAP solution (v_phi_map), and the precision matrix is derived from Hessian/FIM.
+        
+        if compute_hessian == 0: # If compute_hessian is 0, assume infinite precision (delta function prior, no ensemble from Hessian)
+            # This effectively makes mvn_hes sample the same MAP point repeatedly.
+            m_precision_map_hes = torch.diag(torch.full([v_phi_map.numel()], np.inf, dtype=torch.float64))
+            ensemble_vectors_hes = v_phi_map.detach().clone().repeat(ensemble_size, 1) # Simply repeat MAP solution
+        else:
+            # Precision matrix derived from Hessian: (gamma * Identity + N * Hessian)
+            m_precision_map_hes = (gamma * torch.eye(v_phi_map.numel(), dtype=torch.float64) + N * m_hessian)
+            # Create a MultivariateNormal distribution and sample ensemble vectors
+            mvn_hes = torch.distributions.multivariate_normal.MultivariateNormal(
+                loc=v_phi_map, # Mean vector is the MAP solution
+                precision_matrix=m_precision_map_hes # Precision matrix
+            )
+            ensemble_vectors_hes = mvn_hes.sample(sample_shape=[ensemble_size])
+        
+        # Precision matrix derived from FIM: (gamma * Identity + N * FIM)
+        m_precision_map_fim = (gamma * torch.eye(v_phi_map.numel(), dtype=torch.float64) + N * m_fim_D)
+        # Create a MultivariateNormal distribution and sample ensemble vectors
+        mvn_fim = torch.distributions.multivariate_normal.MultivariateNormal(
+            loc=v_phi_map,
+            precision_matrix=m_precision_map_fim
+        )
+        ensemble_vectors_fim = mvn_fim.sample(sample_shape=[ensemble_size])
+        
+    # Return all loss histories and ensemble vectors
+    return v_loss_tr_map, v_loss_te_map, v_lmc_loss_tr, v_lmc_loss_te, ensemble_vectors_hes, ensemble_vectors_fim, ensemble_vectors_lmc
+
+    
