@@ -411,7 +411,7 @@ class FcReluDnn(nn.Module):
             linear_layer = nn.Linear(input_size, output_size, dtype=torch.float64)
             self.hidden.append(linear_layer)
         
-    def forward(self, activation: torch.Tensor) -> torch.Tensor:
+    def forward(self, activation: torch.Tensor): # -> torch.Tensor:
         """
         Forward pass through the neural network.
         
@@ -430,7 +430,7 @@ class FcReluDnn(nn.Module):
                 activation = torch.nn.functional.relu(activation)
         return activation
 
-    def num_parameters(self) -> int:
+    def num_parameters(self): # -> int:
         """
         Calculates the total number of trainable parameters in the model.
         
@@ -454,7 +454,7 @@ class FcReluDnn_external(nn.Module):
         # Note: No need to initialize nn.Linear layers here since parameters are provided externally.
         # This module will be used to apply linear transformations and activations given external weights/biases.
         
-    def forward(self, net_in: torch.Tensor, net_params: list[torch.Tensor]) -> torch.Tensor:
+    def forward(self, net_in: torch.Tensor, net_params: list[torch.Tensor]): # -> torch.Tensor:
         """
         Forward pass using externally provided network parameters.
         
@@ -797,4 +797,342 @@ def fitting_erm_map_gd(model: nn.Module, D_X_training: torch.Tensor, D_y_trainin
     # Return all loss histories and ensemble vectors
     return v_loss_tr_map, v_loss_te_map, v_lmc_loss_tr, v_lmc_loss_te, ensemble_vectors_hes, ensemble_vectors_fim, ensemble_vectors_lmc
 
+
+## 6 - Prediction and Nonconformity Score
+
+def ensemble_predict(X: torch.Tensor, ensemble_vectors: torch.Tensor, model: nn.Module): # -> torch.Tensor:
+    """
+    Performs ensemble prediction by averaging softmax outputs from multiple models.
+    Each model's parameters are loaded from `ensemble_vectors`.
     
+    Args:
+        X (torch.Tensor): Input features for prediction.
+        ensemble_vectors (torch.Tensor): A tensor where each row is a flattened vector of model parameters.
+                                         Shape: [num_ensemble_models, total_parameters].
+        model (nn.Module): An instance of the neural network model (e.g., FcReluDnn). This model's
+                           parameters will be temporarily loaded from `ensemble_vectors` for each prediction.
+                           
+    Returns:
+        torch.Tensor: Averaged softmax probabilities across the ensemble.
+    """
+    R = ensemble_vectors.size(dim=0) # Number of models in the ensemble
+    
+    m_prob_y = None # Initialize aggregated probabilities
+    
+    for r in range(R):
+        # Load parameters for the current ensemble model
+        torch.nn.utils.vector_to_parameters(ensemble_vectors[r, :], model.parameters())
+        
+        # Compute softmax probabilities for the current model
+        current_prob_y = torch.nn.functional.softmax(model(X), dim=1)
+        
+        if r == 0:
+            m_prob_y = current_prob_y
+        else:
+            m_prob_y += current_prob_y
+            
+    m_prob_y /= R # Average probabilities across the ensemble
+    return m_prob_y
+
+def nonconformity_frq(X: torch.Tensor, y: torch.Tensor, model: nn.Module): # -> torch.Tensor:
+    """
+    Calculates nonconformity scores for Frequentist (ML/MAP) predictions.
+    Score is -log(softmax_probability_of_true_label). (Eq. 15 in main article)
+    
+    Args:
+        X (torch.Tensor): Input features.
+        y (torch.Tensor): True labels.
+        model (nn.Module): Trained neural network model.
+        
+    Returns:
+        torch.Tensor: Vector of nonconformity scores.
+    """
+    # Get softmax probabilities from the model
+    m_prob_y = torch.nn.functional.softmax(model(X), dim=1)
+    
+    # Select probabilities corresponding to the true labels
+    # torch.arange(len(y)) creates indices for rows, y selects the column (true label index)
+    true_label_probs = m_prob_y[torch.arange(len(y)), y]
+    
+    # Calculate nonconformity score: -log(P(true_label)) (Eq. 15 in main article)
+    return -torch.log(true_label_probs)
+
+def nonconformity_bay(X: torch.Tensor, y: torch.Tensor, model: nn.Module, ensemble_vectors: torch.Tensor): # -> torch.Tensor:
+    """
+    Calculates nonconformity scores for Bayesian ensemble predictions.
+    Score is -log(averaged_softmax_probability_of_true_label).
+    
+    Args:
+        X (torch.Tensor): Input features.
+        y (torch.Tensor): True labels.
+        model (nn.Module): An instance of the neural network model (used for ensemble_predict).
+        ensemble_vectors (torch.Tensor): Ensemble of model parameters.
+        
+    Returns:
+        torch.Tensor: Vector of nonconformity scores.
+    """
+    # Get averaged softmax probabilities from the ensemble
+    ens_pred = ensemble_predict(X, ensemble_vectors, model)
+    
+    # Select probabilities corresponding to the true labels
+    true_label_probs = ens_pred[torch.arange(len(y)), y]
+    
+    # Calculate nonconformity score: -log(P_ensemble(true_label)) (Eq. 15 in main article)
+    return -torch.log(true_label_probs)
+
+def nonconformity_frq_giq(X: torch.Tensor, y: torch.Tensor, model: nn.Module): # -> torch.Tensor:
+    """
+    Calculates nonconformity scores for Frequentist (ML/MAP) predictions using
+    Generalized Inverse Quantile (GIQ) method.
+    The score is the cumulative probability mass until the true label is reached
+    when classes are sorted by predicted probability (descending).
+    
+    Args:
+        X (torch.Tensor): Input features.
+        y (torch.Tensor): True labels.
+        model (nn.Module): Trained neural network model.
+        
+    Returns:
+        torch.Tensor: Vector of nonconformity scores (cumulative probabilities).
+    """
+    m_prob_y_pred = torch.nn.functional.softmax(model(X), dim=1)
+    
+    # Sort probabilities in descending order and get their original indices
+    m_sorted_probs, m_sorted_indices = torch.sort(m_prob_y_pred, dim=1, descending=True)
+    
+    v_NC = torch.zeros(len(y), dtype=torch.float)
+    
+    for i_sample in range(len(y)):
+        cumulative_prob = 0.0
+        # Iterate through sorted classes until the true label is found
+        for i_class_rank in range(m_sorted_probs.shape[1]): # Iterate through all classes if needed
+            cumulative_prob += m_sorted_probs[i_sample, i_class_rank]
+            # Check if the current class in the sorted list is the true label
+            if m_sorted_indices[i_sample, i_class_rank] == y[i_sample]:
+                break # Stop accumulating once the true label is found
+        v_NC[i_sample] = cumulative_prob
+        
+    return v_NC
+
+def nonconformity_bay_giq(X: torch.Tensor, y: torch.Tensor, model: nn.Module, ensemble_vectors: torch.Tensor): # -> torch.Tensor:
+    """
+    Calculates nonconformity scores for Bayesian ensemble predictions using
+    Generalized Inverse Quantile (GIQ) method.
+    The score is the cumulative probability mass until the true label is reached
+    when classes are sorted by predicted probability (descending), using ensemble predictions.
+    
+    Args:
+        X (torch.Tensor): Input features.
+        y (torch.Tensor): True labels.
+        model (nn.Module): An instance of the neural network model (used for ensemble_predict).
+        ensemble_vectors (torch.Tensor): Ensemble of model parameters.
+        
+    Returns:
+        torch.Tensor: Vector of nonconformity scores (cumulative probabilities).
+    """
+    m_prob_y_pred = ensemble_predict(X, ensemble_vectors, model)
+    
+    # Sort probabilities in descending order and get their original indices
+    m_sorted_probs, m_sorted_indices = torch.sort(m_prob_y_pred, dim=1, descending=True)
+    
+    v_NC = torch.zeros(len(y), dtype=torch.float)
+    
+    for i_sample in range(len(y)):
+        cumulative_prob = 0.0
+        # Iterate through sorted classes until the true label is found
+        for i_class_rank in range(m_sorted_probs.shape[1]):
+            cumulative_prob += m_sorted_probs[i_sample, i_class_rank]
+            if m_sorted_indices[i_sample, i_class_rank] == y[i_sample]:
+                break
+        v_NC[i_sample] = cumulative_prob
+        
+    return v_NC
+
+## 7. Quantile Functions 
+def quantile_from_top(vec: torch.Tensor, alpha: float): # -> torch.Tensor:
+    """
+    Calculates the empirical quantile from the top (1-alpha quantile).
+    Used for Conformal Prediction threshold.
+    
+    Args:
+        vec (torch.Tensor): Input vector of scores.
+        alpha (float): Miscoverage level (e.g., 0.1 for 90% coverage).
+        
+    Returns:
+        torch.Tensor: The calculated quantile value.
+    """
+    # Append infinity to the vector to handle edge cases in quantile calculation
+    torch_inf = torch.tensor(torch.inf).unsqueeze(0).to(vec.device) # Ensure inf is on same device as vec
+    sorted_vec, _ = torch.sort(torch.cat((vec, torch_inf)))
+    
+    # Calculate the index for the quantile.
+    # np.ceil((1-alpha)*(len(vec)+1)-1) corresponds to the rank in a 0-indexed sorted array.
+    # This is equivalent to the original author's (1-alpha)*(N+1) rule.
+    quantile_idx = int(np.ceil((1 - alpha) * (len(vec) + 1) - 1))
+    
+    return sorted_vec[quantile_idx]
+
+def quantile_from_btm(vec: torch.Tensor, alpha: float): # -> torch.Tensor:
+    """
+    Calculates the empirical quantile from the bottom (alpha quantile).
+    This is equivalent to finding the (1-alpha) quantile of the negative values.
+    
+    Args:
+        vec (torch.Tensor): Input vector.
+        alpha (float): Quantile level (e.g., 0.1).
+        
+    Returns:
+        torch.Tensor: The calculated quantile value.
+    """
+    return -quantile_from_top(-vec, alpha)
+
+# 8. Conformal Prediction Evaluation Functions 
+
+def vb__covrg_and_ineff(m_NC_prs: torch.Tensor, v_NC_val: torch.Tensor, y_te: torch.Tensor, alpha: float): # -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Calculates coverage for Validation-Based Conformal Prediction (VB-CP).
+    
+    Args:
+        m_NC_prs (torch.Tensor): Prospective NC scores for all test samples and all possible labels.
+                                 Shape [N_te, num_classes].
+        v_NC_val (torch.Tensor): Nonconformity scores from the validation set. Shape [N_val].
+        y_te (torch.Tensor): True labels for test samples.
+        alpha (float): Miscoverage level.
+        
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]:
+            - coverage (torch.Tensor): Overall empirical coverage.
+            - coverage_per_label (torch.Tensor): Empirical coverage per true label.
+    """
+    # Calculate the quantile from the validation NC scores
+    quan_val = quantile_from_top(v_NC_val, alpha) # Scalar threshold
+    
+    # Determine which labels are included in the prediction set for each test sample
+    # m_is_prs_in_pred_set is a Boolean matrix [N_te, num_classes] (1 if included, 0 if not)
+    m_is_prs_in_pred_set = (m_NC_prs <= quan_val).float()
+    
+    # Check if the true label (y_te) for each test sample is included in its prediction set
+    v_is_y_te_in_pred = m_is_prs_in_pred_set[torch.arange(len(y_te)), y_te]
+    
+    # Calculate overall coverage (mean of whether true label was included)
+    covrg = v_is_y_te_in_pred.mean()
+    
+    num_classes = m_is_prs_in_pred_set.shape[1]
+    
+    v_covrg_labels = torch.zeros(num_classes, dtype=torch.float)
+    # v_ineff_labels is removed as per requirement
+
+    # Calculate coverage per true label
+    for i_y in torch.arange(num_classes):
+        # Find indices of test samples that have current true label i_y
+        indices_i_y = (y_te == i_y).nonzero(as_tuple=True)[0] 
+        if indices_i_y.numel() > 0: # Ensure there are samples for this label
+            # Coverage for this label: mean of inclusion of true label for relevant samples
+            v_covrg_labels[i_y] = m_is_prs_in_pred_set[indices_i_y, y_te[indices_i_y]].mean()
+        else: # If no samples for this label, set to NaN
+            v_covrg_labels[i_y] = float('nan')
+            
+    # Overall inefficiency calculation is removed
+    # ineff = m_is_prs_in_pred_set.sum(dim=1).mean()
+    
+    # Return only coverage metrics
+    return covrg, v_covrg_labels
+
+
+def cv_covrg_and_ineff(m_NC_prs: torch.Tensor, v_NC: torch.Tensor, y_te: torch.Tensor, alpha: float): # -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Calculates coverage for CV-CP.
+    Inefficiency calculations are removed.
+    
+    Args:
+        m_NC_prs (torch.Tensor): Prospective NC scores for test samples.
+                                 Shape: [N_te, num_classes, N_calib] (N_calib is total number of calibration samples).
+        v_NC (torch.Tensor): All N (or N_calib) nonconformity scores from the calibration process. Shape [N_calib].
+        y_te (torch.Tensor): True labels for test samples.
+        alpha (float): Miscoverage level.
+        
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]:
+            - coverage (torch.Tensor): Overall empirical coverage.
+            - coverage_per_label (torch.Tensor): Empirical coverage per true label.
+    """
+    N_calib_total = len(v_NC)
+    # th: Threshold for inclusion (based on (1-alpha)*(N_calib+1) from theory)
+    th = (1 - alpha) * (N_calib_total + 1)
+    
+    # m_is_prs_in_pred_set: Boolean matrix [N_te, num_classes] indicating if a label is in the prediction set.
+    # If this count (calib scores LARGER than prospective NC score) is less than `th`, the label is included. (Eq. 18)
+    m_is_prs_in_pred_set = ((m_NC_prs > v_NC.view(1, 1, -1)).float().sum(dim=2) < th).float()
+    
+    # Check if the true label for each test sample is included in its prediction set
+    v_is_y_te_in_pred = m_is_prs_in_pred_set[torch.arange(len(y_te)), y_te]
+    
+    # Calculate overall coverage
+    covrg = v_is_y_te_in_pred.mean()
+    
+    num_classes = m_is_prs_in_pred_set.shape[1]
+    
+    v_covrg_labels = torch.zeros(num_classes, dtype=torch.float)
+    # v_ineff_labels is removed
+
+    # Calculate coverage per true label
+    for i_y in torch.arange(num_classes):
+        indices_i_y = (y_te == i_y).nonzero(as_tuple=True)[0]
+        if indices_i_y.numel() > 0:
+            v_covrg_labels[i_y] = m_is_prs_in_pred_set[indices_i_y, y_te[indices_i_y]].mean()
+        else:
+            v_covrg_labels[i_y] = float('nan')
+            
+    # Overall inefficiency calculation is removed
+    # ineff = m_is_prs_in_pred_set.sum(dim=1).mean()
+    
+    # Return only coverage metrics
+    return covrg, v_covrg_labels
+
+
+def kcv_covrg_and_ineff(m_NC_prs: torch.Tensor, v_NC: torch.Tensor, y_te: torch.Tensor, alpha: float): # -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Calculates coverage for K-CV-CP.
+    
+    Args:
+        m_NC_prs (torch.Tensor): Prospective NC scores for test samples.
+                                 Shape: [N_te, num_classes, N_total_calibration_samples].
+        v_NC (torch.Tensor): All N (or N_total_calibration_samples) nonconformity scores from the K-fold process. Shape [N_total_calibration_samples].
+        y_te (torch.Tensor): True labels for test samples.
+        alpha (float): Miscoverage level.
+        
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]:
+            - coverage (torch.Tensor): Overall empirical coverage.
+            - coverage_per_label (torch.Tensor): Empirical coverage per true label.
+    """
+    # The logic is identical to jkp_covrg_and_ineff for prediction set formation.
+    # The distinction between KFP and JKP lies in how m_NC_prs and v_NC are generated.
+    
+    N_calib_total = len(v_NC)
+    th = (1 - alpha) * (N_calib_total + 1)
+    
+    # If this count (calib scores LARGER than prospective NC score) is less than `th`, the label is included. (Eq. 18)
+    m_is_prs_in_pred_set = ((m_NC_prs > v_NC.view(1, 1, -1)).float().sum(dim=2) < th).float()
+    
+    v_is_y_te_in_pred = m_is_prs_in_pred_set[torch.arange(len(y_te)), y_te]
+    
+    covrg = v_is_y_te_in_pred.mean()
+    
+    num_classes = m_is_prs_in_pred_set.shape[1]
+    
+    v_covrg_labels = torch.zeros(num_classes, dtype=torch.float)
+    # v_ineff_labels is removed
+
+    for i_y in torch.arange(num_classes):
+        indices_i_y = (y_te == i_y).nonzero(as_tuple=True)[0]
+        if indices_i_y.numel() > 0:
+            v_covrg_labels[i_y] = m_is_prs_in_pred_set[indices_i_y, y_te[indices_i_y]].mean()
+        else:
+            v_covrg_labels[i_y] = float('nan')
+            
+    # Overall inefficiency calculation is removed
+    # ineff = m_is_prs_in_pred_set.sum(dim=1).mean()
+    
+    # Return only coverage metrics
+    return covrg, v_covrg_labels
