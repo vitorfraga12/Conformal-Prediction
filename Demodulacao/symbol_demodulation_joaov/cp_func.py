@@ -68,7 +68,8 @@ def get8APSK():
         'gray_mapping': gray_mapping,
         'bit_mapping': bit_mapping,
         'normalized': True,
-        'description': '8APSK constellation with Gray coding'
+        'description': '8APSK constellation with Gray coding',
+        'order': 8  # Fixed order for 8APSK
     }
 
 def modulate_8apsk(bits, constellation_params=None):
@@ -197,7 +198,8 @@ def channel_states():
     ch_mult_factor = torch.randn(1, dtype=torch.cfloat) # Corresponds to ψ (psi) in the article 
 
     # Create a beta distribution for the transmitter imperfection factors
-    rand_beta_dist_instance = torch.distributions.Beta(torch.tensor(5), torch.tensor(2))
+    # CORREÇÃO: Especifique dtype=torch.float ou torch.double para os tensores
+    rand_beta_dist_instance = torch.distributions.Beta(torch.tensor(5.0), torch.tensor(2.0)) # Ou use .float() ou .double()
     
     # If AWGN situation is forced, remove amplitude variation from fading
     if awgn_situation: 
@@ -216,7 +218,7 @@ def channel_states():
     
     return d_channel_state
 
-def simulate_channel_aplication(num_samples, b_enforce_pattern, b_noise_free,
+def simulate_channel_application(num_samples, b_enforce_pattern, b_noise_free,
                                 d_setting, channel_state, mod_constellation_params):
     """
     Simulates a channel step for demodulation, applying imperfections and noise.
